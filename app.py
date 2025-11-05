@@ -1,407 +1,124 @@
 """
-T5 Supercharged Summarization Tool
-Multi-modal AI summarization with authentication
+AI Summarizer - Working Version
 """
 
-import os
-import io
-import tempfile
-from typing import List, Dict, Optional
+import streamlit as st
 import hashlib
 
-import streamlit as st
-from PIL import Image
-import numpy as np
-
-# PDF handling
 try:
-    import fitz  # PyMuPDF
-    PYMUPDF_OK = True
+    from google import genai
+    from google.genai import types
+    GENAI_AVAILABLE = True
 except:
-    PYMUPDF_OK = False
-
-try:
-    import pdfplumber
-    PDFPLUMBER_OK = True
-except:
-    PDFPLUMBER_OK = False
-
-from PyPDF2 import PdfReader
-
-# Audio
-import speech_recognition as sr
-from pydub import AudioSegment
-
-# NLP
-import langdetect
-from deep_translator import GoogleTranslator
-
-# Transformers
-try:
-    import torch
-    from transformers import T5Tokenizer, T5ForConditionalGeneration
-except:
-    torch = None
-    T5Tokenizer = None
-
-# Embeddings
-try:
-    from sentence_transformers import SentenceTransformer
-except:
-    SentenceTransformer = None
-
-from sklearn.metrics.pairwise import cosine_similarity
-
-try:
-    import faiss
-    FAISS_OK = True
-except:
-    FAISS_OK = False
-
-# Graph
-import networkx as nx
-from pyvis.network import Network
-from streamlit.components.v1 import html as st_html
-
-# Exports
-from reportlab.pdfgen import canvas as rl_canvas
-from docx import Document
-from gtts import gTTS
-
-# Gemini
-from google import genai
-from google.genai import types
+    GENAI_AVAILABLE = False
 
 # ================================
-# CONFIGURATION
+# CONFIG
 # ================================
 
 st.set_page_config(
-    page_title="🚀 AI Summarizer Pro",
+    page_title="🚀 AI Summarizer",
     page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
 # ================================
-# AUTHENTICATION SYSTEM
+# AUTHENTICATION
 # ================================
 
-# Simple user database (in production, use a real database)
 USERS = {
-    "admin": hashlib.sha256("admin123".encode()).hexdigest(),
     "demo": hashlib.sha256("demo123".encode()).hexdigest(),
+    "admin": hashlib.sha256("admin123".encode()).hexdigest(),
 }
 
 def check_password():
-    """Returns True if user is authenticated"""
-    
-    def login_form():
-        with st.form("login_form"):
-            st.subheader("🔐 Login Required")
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submit = st.form_submit_button("Login")
-            
-            if submit:
-                password_hash = hashlib.sha256(password.encode()).hexdigest()
-                if username in USERS and USERS[username] == password_hash:
-                    st.session_state["authenticated"] = True
-                    st.session_state["username"] = username
-                    st.success("✅ Login successful!")
-                    st.rerun()
-                else:
-                    st.error("❌ Invalid credentials")
-                    st.info("**Demo credentials:**\nUsername: `demo`\nPassword: `demo123`")
-    
-    # Check if already authenticated
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
     
     if not st.session_state["authenticated"]:
-        login_form()
+        st.markdown("## 🔐 AI Summarizer Login")
+        st.markdown("---")
+        
+        with st.form("login"):
+            st.subheader("Please Login")
+            user = st.text_input("Username")
+            pwd = st.text_input("Password", type="password")
+            
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                submitted = st.form_submit_button("🔓 Login", use_container_width=True)
+            
+            if submitted:
+                pwd_hash = hashlib.sha256(pwd.encode()).hexdigest()
+                if user in USERS and USERS[user] == pwd_hash:
+                    st.session_state["authenticated"] = True
+                    st.session_state["username"] = user
+                    st.success("✅ Login successful!")
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid credentials")
+        
+        st.info("**Demo Account:**\n- Username: `demo`\n- Password: `demo123`")
         return False
-    
     return True
 
-def logout():
-    """Logout current user"""
-    st.session_state["authenticated"] = False
-    st.session_state["username"] = None
-    st.rerun()
-
 # ================================
-# GEMINI CLIENT
+# GEMINI
 # ================================
 
-def get_gemini_client():
-    """Initialize Gemini client with API key"""
-    # Priority: Streamlit secrets > Environment > User input
-    api_key = None
+def get_client():
+    if not GENAI_AVAILABLE:
+        st.error("google-genai package not installed")
+        return None
     
+    key = None
     if hasattr(st, 'secrets') and 'GEMINI_API_KEY' in st.secrets:
-        api_key = st.secrets['GEMINI_API_KEY']
-    elif 'GEMINI_API_KEY' in os.environ:
-        api_key = os.environ['GEMINI_API_KEY']
+        key = st.secrets['GEMINI_API_KEY']
     
-    if not api_key:
+    if not key:
         with st.sidebar:
-            api_key = st.text_input("🔑 Gemini API Key", type="password", 
-                                   help="Get free key at https://aistudio.google.com/apikey")
+            st.markdown("### 🔑 API Configuration")
+            key = st.text_input(
+                "Gemini API Key",
+                type="password",
+                help="Get your free key at https://aistudio.google.com/apikey"
+            )
     
-    if api_key:
+    if key:
         try:
-            return genai.Client(api_key=api_key)
+            return genai.Client(api_key=key)
         except Exception as e:
-            st.error(f"Failed to initialize Gemini: {e}")
-            return None
+            st.error(f"Failed to connect: {e}")
     return None
 
-# ================================
-# CACHED RESOURCES
-# ================================
-
-@st.cache_resource(show_spinner=False)
-def load_t5(model_name: str):
-    """Load T5 model (fallback option)"""
-    if T5Tokenizer is None:
-        raise RuntimeError("Transformers not available")
-    tokenizer = T5Tokenizer.from_pretrained(model_name)
-    model = T5ForConditionalGeneration.from_pretrained(model_name)
-    device = "cuda" if (torch and torch.cuda.is_available()) else "cpu"
-    if device == "cuda":
-        model.to("cuda")
-    return tokenizer, model, device
-
-@st.cache_resource(show_spinner=False)
-def load_embedder():
-    """Load sentence embedder"""
-    if SentenceTransformer is None:
-        raise RuntimeError("sentence-transformers not available")
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-@st.cache_resource(show_spinner=False)
-def load_spacy():
-    """Load spaCy for NER"""
-    try:
-        import spacy
-        return spacy.load("en_core_web_sm")
-    except:
-        return None
-
-# ================================
-# UTILITY FUNCTIONS
-# ================================
-
-def detect_language(text: str) -> str:
-    """Detect text language"""
-    try:
-        return langdetect.detect(text)
-    except:
-        return "en"
-
-def translate_text(text: str, target_lang: str = "en") -> str:
-    """Translate text to target language"""
-    if not text:
-        return text
-    try:
-        return GoogleTranslator(source="auto", target=target_lang).translate(text)
-    except:
-        return text
-
-def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 120) -> List[str]:
-    """Split text into overlapping chunks"""
-    words = text.split()
-    chunks = []
-    i = 0
-    while i < len(words):
-        chunk = words[i:i + chunk_size]
-        chunks.append(" ".join(chunk))
-        i += max(1, chunk_size - overlap)
-    return chunks
-
-# ================================
-# PDF EXTRACTION
-# ================================
-
-def extract_text_from_pdf(file) -> Dict:
-    """Extract text from PDF using multiple methods"""
-    text_all = []
-    tables = []
-    pages = 0
-    
-    file_bytes = file.read()
-    
-    # Try PyMuPDF first (best)
-    if PYMUPDF_OK:
-        try:
-            with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-                pages = doc.page_count
-                for page in doc:
-                    text_all.append(page.get_text("text") or "")
-        except Exception as e:
-            st.info(f"PyMuPDF fallback: {e}")
-    
-    # Try pdfplumber
-    if PDFPLUMBER_OK and not text_all:
-        try:
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                pages = len(pdf.pages)
-                for p in pdf.pages:
-                    t = p.extract_text() or ""
-                    if t:
-                        text_all.append(t)
-                    try:
-                        tbs = p.extract_tables() or []
-                        for tb in tbs:
-                            if tb:
-                                tables.append(tb)
-                    except:
-                        pass
-        except Exception as e:
-            st.info(f"pdfplumber fallback: {e}")
-    
-    # Fallback to PyPDF2
-    if not text_all:
-        try:
-            reader = PdfReader(io.BytesIO(file_bytes))
-            pages = len(reader.pages)
-            for page in reader.pages:
-                text_all.append(page.extract_text() or "")
-        except Exception as e:
-            return {"text": "", "pages": 0, "tables": [], "error": str(e)}
-    
-    return {
-        "text": "\n".join(text_all),
-        "pages": pages,
-        "tables": tables
-    }
-
-# ================================
-# AUDIO TRANSCRIPTION
-# ================================
-
-def transcribe_audio(uploaded_audio) -> str:
-    """Convert audio to text"""
-    try:
-        audio = AudioSegment.from_file(io.BytesIO(uploaded_audio.read()))
-        buf = io.BytesIO()
-        audio.export(buf, format="wav")
-        
-        recognizer = sr.Recognizer()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp.write(buf.getvalue())
-            tmp.flush()
-            
-            with sr.AudioFile(tmp.name) as source:
-                audio_data = recognizer.record(source)
-                try:
-                    return recognizer.recognize_google(audio_data)
-                except:
-                    return ""
-    except Exception as e:
-        st.error(f"Transcription failed: {e}")
-        return ""
-
-# ================================
-# SUMMARIZATION FUNCTIONS
-# ================================
-
-def gemini_summarize(client, text: str, style: str = "concise", target_lang: str = "en") -> str:
-    """Summarize using Gemini"""
+def summarize_text(client, text, style="concise", max_length=500):
     if not client or not text.strip():
         return ""
     
     style_prompts = {
-        "concise": "Create a brief summary in 3-5 sentences.",
-        "bullet": "Create a bullet-point summary with key takeaways.",
-        "detailed": "Create a comprehensive summary with main points and details.",
+        "concise": "Create a brief, concise summary in 3-5 sentences.",
+        "detailed": "Create a comprehensive, detailed summary covering all key points.",
+        "bullets": "Create a bullet-point summary with key takeaways and main ideas.",
+        "academic": "Create a formal academic summary with technical detail."
     }
     
-    prompt = f"{style_prompts.get(style, style_prompts['concise'])}\n\nLanguage: {target_lang}\n\n{text[:8000]}"
+    prompt = f"""
+{style_prompts.get(style, style_prompts['concise'])}
+
+Keep the summary under {max_length} words.
+
+TEXT TO SUMMARIZE:
+{text[:10000]}
+"""
     
     try:
         response = client.models.generate_content(
             model="gemini-1.5-flash",
             contents=prompt
         )
-        return response.text or ""
+        return response.text or "No summary generated."
     except Exception as e:
-        st.error(f"Gemini error: {e}")
-        return ""
-
-def gemini_qa(client, question: str, context: str, target_lang: str = "en") -> str:
-    """Answer questions using Gemini"""
-    if not client:
-        return ""
-    
-    prompt = f"Context:\n{context[:6000]}\n\nQuestion: {question}\n\nAnswer in {target_lang}:"
-    
-    try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt
-        )
-        return response.text or ""
-    except Exception as e:
-        st.error(f"Q&A error: {e}")
-        return ""
-
-def gemini_vision(client, image_bytes: bytes, mime_type: str, target_lang: str = "en") -> str:
-    """Analyze image using Gemini Vision"""
-    if not client:
-        return ""
-    
-    try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=[
-                types.Part(inline_data=types.Blob(mime_type=mime_type, data=image_bytes)),
-                types.Part(text=f"Describe and extract text. Language: {target_lang}")
-            ]
-        )
-        return response.text or ""
-    except Exception as e:
-        st.error(f"Vision error: {e}")
-        return ""
-
-# ================================
-# EXPORT FUNCTIONS
-# ================================
-
-def save_as_txt(text: str) -> bytes:
-    """Export as TXT"""
-    return text.encode("utf-8")
-
-def save_as_pdf(text: str) -> bytes:
-    """Export as PDF"""
-    buffer = io.BytesIO()
-    c = rl_canvas.Canvas(buffer)
-    c.setFont("Helvetica", 12)
-    
-    y = 800
-    for line in text.split("\n"):
-        if y < 50:
-            c.showPage()
-            y = 800
-        c.drawString(50, y, line[:90])
-        y -= 15
-    
-    c.save()
-    buffer.seek(0)
-    return buffer.getvalue()
-
-def save_as_docx(text: str) -> bytes:
-    """Export as DOCX"""
-    doc = Document()
-    doc.add_heading("Summary", level=1)
-    for para in text.split("\n\n"):
-        doc.add_paragraph(para)
-    
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    buffer.seek(0)
-    return buffer.getvalue()
+        return f"Error generating summary: {e}"
 
 # ================================
 # MAIN APP
@@ -412,178 +129,149 @@ def main():
     if not check_password():
         return
     
-    # Header with logout
-    col1, col2 = st.columns([6, 1])
+    # Header
+    st.title("🚀 AI Summarizer Pro")
+    
+    col1, col2 = st.columns([5, 1])
     with col1:
-        st.title("🚀 AI Summarizer Pro")
-        st.caption(f"Welcome, **{st.session_state.get('username', 'User')}**!")
+        st.caption(f"👤 Logged in as: **{st.session_state.get('username', 'User')}**")
     with col2:
         if st.button("🚪 Logout", use_container_width=True):
-            logout()
+            st.session_state["authenticated"] = False
+            st.session_state["username"] = None
+            st.rerun()
     
     st.markdown("---")
     
-    # Initialize Gemini
-    client = get_gemini_client()
+    # Initialize Gemini client
+    client = get_client()
+    
     if not client:
-        st.warning("⚠️ Please provide Gemini API Key to use AI features")
-        st.info("Get free API key: https://aistudio.google.com/apikey")
+        st.warning("⚠️ Please configure your Gemini API key in the sidebar")
+        st.info("""
+        **To get started:**
+        1. Get a free API key: https://aistudio.google.com/apikey
+        2. Enter it in the sidebar
+        3. Start summarizing!
+        """)
         return
     
     # Sidebar settings
     with st.sidebar:
         st.header("⚙️ Settings")
-        input_type = st.selectbox("📥 Input Type", 
-                                  ["Text", "PDF", "Image", "Audio"])
-        style = st.selectbox("✍️ Summary Style", 
-                            ["concise", "bullet", "detailed"])
-        target_lang = st.text_input("🌐 Language Code", "en",
-                                   help="e.g., en, es, fr, hi")
+        
+        style = st.selectbox(
+            "📝 Summary Style",
+            ["concise", "detailed", "bullets", "academic"],
+            help="Choose how you want the summary formatted"
+        )
+        
+        max_words = st.slider(
+            "📏 Max Summary Length (words)",
+            min_value=50,
+            max_value=1000,
+            value=200,
+            step=50
+        )
         
         st.markdown("---")
-        st.markdown("### 📊 Usage Stats")
+        
+        # Stats
         if "summary_count" not in st.session_state:
             st.session_state.summary_count = 0
-        st.metric("Summaries Generated", st.session_state.summary_count)
+        
+        st.markdown("### 📊 Statistics")
+        st.metric("Total Summaries", st.session_state.summary_count)
     
     # Main content area
-    if input_type == "Text":
-        handle_text_input(client, style, target_lang)
-    elif input_type == "PDF":
-        handle_pdf_input(client, style, target_lang)
-    elif input_type == "Image":
-        handle_image_input(client, style, target_lang)
-    elif input_type == "Audio":
-        handle_audio_input(client, style, target_lang)
-
-def handle_text_input(client, style, target_lang):
-    """Handle text summarization"""
     st.subheader("📝 Text Summarization")
     
-    text = st.text_area("Enter or paste text:", height=200,
-                       placeholder="Paste your text here...")
+    # Text input
+    text_input = st.text_area(
+        "Enter or paste your text below:",
+        height=300,
+        placeholder="Paste your article, document, or any text you want to summarize...",
+        help="Maximum 10,000 characters"
+    )
     
-    if st.button("✨ Summarize", type="primary"):
-        if not text.strip():
-            st.warning("Please enter some text")
-            return
-        
-        with st.spinner("Generating summary..."):
-            summary = gemini_summarize(client, text, style, target_lang)
-            
-            if summary:
-                st.session_state.summary_count += 1
-                st.success("✅ Summary generated!")
-                
-                st.markdown("### 📄 Summary")
-                st.write(summary)
-                
-                # Download buttons
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.download_button("📥 TXT", save_as_txt(summary), 
-                                     "summary.txt", "text/plain")
-                with col2:
-                    st.download_button("📥 PDF", save_as_pdf(summary),
-                                     "summary.pdf", "application/pdf")
-                with col3:
-                    st.download_button("📥 DOCX", save_as_docx(summary),
-                                     "summary.docx", 
-                                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-
-def handle_pdf_input(client, style, target_lang):
-    """Handle PDF summarization"""
-    st.subheader("📄 PDF Summarization")
+    # Character count
+    if text_input:
+        char_count = len(text_input)
+        st.caption(f"Characters: {char_count:,} / 10,000")
     
-    uploaded_pdf = st.file_uploader("Upload PDF", type="pdf")
+    # Summarize button
+    col1, col2, col3 = st.columns([2, 2, 6])
+    with col1:
+        summarize_btn = st.button("✨ Summarize", type="primary", use_container_width=True)
+    with col2:
+        if text_input:
+            clear_btn = st.button("🗑️ Clear", use_container_width=True)
+            if clear_btn:
+                st.rerun()
     
-    if uploaded_pdf:
-        with st.spinner("Extracting PDF..."):
-            data = extract_text_from_pdf(uploaded_pdf)
-        
-        if data.get("error"):
-            st.error(f"Error: {data['error']}")
-            return
-        
-        pdf_text = data.get("text", "")
-        pages = data.get("pages", 0)
-        
-        st.success(f"✅ Extracted {pages} pages")
-        
-        with st.expander("📖 Preview"):
-            st.text(pdf_text[:1000] + "...")
-        
-        if st.button("✨ Summarize PDF", type="primary"):
-            with st.spinner("Summarizing..."):
-                summary = gemini_summarize(client, pdf_text, style, target_lang)
+    # Process summarization
+    if summarize_btn:
+        if not text_input.strip():
+            st.warning("⚠️ Please enter some text to summarize")
+        elif len(text_input) < 50:
+            st.warning("⚠️ Text is too short. Please enter at least 50 characters.")
+        else:
+            with st.spinner("🤖 Generating summary..."):
+                summary = summarize_text(client, text_input, style, max_words)
                 
-                if summary:
+                if summary and not summary.startswith("Error"):
                     st.session_state.summary_count += 1
+                    st.success("✅ Summary generated successfully!")
+                    
+                    # Display summary
                     st.markdown("### 📄 Summary")
+                    st.markdown("---")
                     st.write(summary)
+                    st.markdown("---")
                     
-                    col1, col2 = st.columns(2)
+                    # Download options
+                    st.markdown("### 💾 Download Options")
+                    col1, col2, col3 = st.columns(3)
+                    
                     with col1:
-                        st.download_button("📥 TXT", save_as_txt(summary),
-                                         "summary.txt")
+                        st.download_button(
+                            label="📥 Download as TXT",
+                            data=summary,
+                            file_name="summary.txt",
+                            mime="text/plain",
+                            use_container_width=True
+                        )
+                    
                     with col2:
-                        st.download_button("📥 PDF", save_as_pdf(summary),
-                                         "summary.pdf")
-
-def handle_image_input(client, style, target_lang):
-    """Handle image analysis"""
-    st.subheader("🖼️ Image Analysis")
-    
-    uploaded_image = st.file_uploader("Upload Image", 
-                                     type=["png", "jpg", "jpeg"])
-    
-    if uploaded_image:
-        image = Image.open(uploaded_image)
-        st.image(image, caption="Uploaded Image", use_container_width=True)
-        
-        if st.button("🔍 Analyze", type="primary"):
-            with st.spinner("Analyzing image..."):
-                result = gemini_vision(client, uploaded_image.getvalue(),
-                                     uploaded_image.type, target_lang)
-                
-                if result:
-                    st.session_state.summary_count += 1
-                    st.markdown("### 📊 Analysis")
-                    st.write(result)
+                        # Create markdown version
+                        md_content = f"# Summary\n\n**Style:** {style}\n\n**Generated:** {st.session_state.get('username', 'User')}\n\n---\n\n{summary}"
+                        st.download_button(
+                            label="📥 Download as MD",
+                            data=md_content,
+                            file_name="summary.md",
+                            mime="text/markdown",
+                            use_container_width=True
+                        )
                     
-                    st.download_button("📥 Save", save_as_txt(result),
-                                     "analysis.txt")
-
-def handle_audio_input(client, style, target_lang):
-    """Handle audio transcription"""
-    st.subheader("🎤 Audio Transcription")
-    
-    uploaded_audio = st.file_uploader("Upload Audio",
-                                     type=["wav", "mp3", "m4a"])
-    
-    if uploaded_audio:
-        st.audio(uploaded_audio)
-        
-        if st.button("🎯 Transcribe & Summarize", type="primary"):
-            with st.spinner("Transcribing..."):
-                text = transcribe_audio(uploaded_audio)
-                
-                if text:
-                    st.markdown("### 📝 Transcript")
-                    st.write(text)
-                    
-                    with st.spinner("Summarizing..."):
-                        summary = gemini_summarize(client, text, style, target_lang)
-                        
-                        if summary:
-                            st.session_state.summary_count += 1
-                            st.markdown("### 📄 Summary")
-                            st.write(summary)
-                            
-                            st.download_button("📥 Save", save_as_txt(summary),
-                                             "summary.txt")
+                    # Store in session for history
+                    if "history" not in st.session_state:
+                        st.session_state.history = []
+                    st.session_state.history.append({
+                        "input": text_input[:200] + "..." if len(text_input) > 200 else text_input,
+                        "summary": summary,
+                        "style": style
+                    })
                 else:
-                    st.warning("No speech detected")
+                    st.error(summary)
+    
+    # History section
+    if "history" in st.session_state and st.session_state.history:
+        with st.expander("📜 Recent Summaries", expanded=False):
+            for i, item in enumerate(reversed(st.session_state.history[-5:])):
+                st.markdown(f"**Summary {len(st.session_state.history) - i}** ({item['style']})")
+                st.caption(f"Input: {item['input']}")
+                st.info(item['summary'])
+                st.markdown("---")
 
 if __name__ == "__main__":
     main()
